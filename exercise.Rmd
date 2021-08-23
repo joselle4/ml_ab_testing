@@ -1,0 +1,368 @@
+---
+title: "A/B Testing"
+output: html_notebook
+---
+
+# Tutorial Source:
+https://www.business-science.io/business/2019/03/11/ab-testing-machine-learning.html
+
+# A/B Testing
+- aka split testing or bucket testing
+- in marketing, A/B testing enables us to determine whether changes in landing pages, popup forms, article titles, and other digital marketing decisions improve conversion rates and ultimately customer purchasing favor
+- a successful A/B testing strategy can lead to massive gains - more satisfied users, more engagement, and more sales
+
+## Method
+2 tests are run in parallel:
+1. Treatment Group (Group A) - group exposed to the new web page, popup form, etc
+2. Control Group (Group B) - group experiences no change from the current setup
+- goal is to compare the conversion rates of the two groups using statistical inference
+
+# ML - A/B Testing 
+- tidyverse and tidyquant: These are the core data manipulation and visualization packages. We’ll mainly be using dplyr for data manipulation, ggplot2 for data visualization, and tidyquant themes for business reporting.
+- parsnip, rsample, recipes, and yardstick: These are the tidyverse modeling packages. The parsnip package is an amazing tool that connects to the main machine learning algorithms. We teach parsnip in-depth (44 lessons, 5 hours of video) in Business Analysis with R, Week 6, Part 2 - Machine Learning (Regression).
+- rpart, rpart.plot, and xgboost: These are the modeling libraries that we’ll connect to through the parsnip interface.
+
+```{r libraries, warning=FALSE}
+# Core packages
+library(tidyverse)
+library(tidyquant)
+
+# Modeling packages
+library(parsnip)
+library(recipes)
+library(rsample)
+library(yardstick)
+library(broom)
+
+# Connector packages
+library(rpart)
+library(rpart.plot)
+library(xgboost)
+
+# Other packages
+library(data.table)
+library(plotly)
+```
+
+```{r load_data}
+control_tbl <- fread("control_data.csv")
+experiment_tbl <- fread("experiment_data.csv")
+```
+
+## Investigate Data
+
+```{r}
+head(control_tbl) 
+```
+
+```{r}
+glimpse(control_tbl)
+```
+
+```{r}
+glimpse(experiment_tbl)
+```
+Conclusions:
+- data is in character format; need to convert to date
+- payment is an outcome of enrollments so this should be removed
+
+## Check for Missing Data
+```{r}
+control_tbl %>% 
+  map_df(~ sum(is.na(.))) %>% 
+  gather(key = "feature", value = "missing_count") %>% 
+  arrange(desc(missing_count))
+```
+
+```{r}
+experiment_tbl %>% 
+  map_df(~ sum(is.na(.))) %>% 
+  gather(key = "feature", value = "missing_count") %>% 
+  arrange(desc(missing_count))
+```
+
+```{r}
+control_tbl %>% 
+  filter(is.na(Enrollments))
+```
+- we don't have Enrollment information from November 3rd on.  We will need to remove these observations
+
+## Format Data
+- Combine the control_tbl and experiment_tbl, adding an “id” column indicating if the data was part of the experiment or not
+- Add a “row_id” column to help for tracking which rows are selected for training and testing in the modeling section
+- Create a “Day of Week” feature from the “Date” column
+- Drop the unnecessary “Date” column and the “Payments” column
+- Handle the missing data (NA) by removing these rows.
+- Shuffle the rows to mix the data up for learning
+- Reorganize the columns
+
+```{r}
+set.seed(123)
+
+data_formatted_tbl <- control_tbl %>% 
+  
+  # combine with experiment data
+  bind_rows(experiment_tbl, .id = "Experiment") %>% 
+  mutate(Experiment = as.numeric(Experiment) - 1) %>% 
+  
+  # add row id
+  mutate(row_id = row_number()) %>% 
+  
+  # create a day of week feature
+  mutate(DOW = str_sub(Date, start = 1, end = 3) %>% 
+           factor(levels = c("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"))
+         ) %>% 
+  select(-Date, -Payments) %>% 
+  
+  # remove missing data
+  filter(!is.na(Enrollments)) %>% 
+  
+  # shuffle the data (note that set.seed is used to make reproducible)
+  slice_sample(prop = 1) %>% 
+  
+  # reorganize columns
+  select(row_id, Enrollments, Experiment, everything())
+
+glimpse(data_formatted_tbl)
+```
+## Split Data: Training and Testing
+
+```{r}
+set.seed(123)
+
+split_obj <- data_formatted_tbl %>% data.table() %>% 
+  initial_split(prop = 0.8, strata = "Experiment")
+
+train_tbl <- training(split_obj)
+test_tbl <- testing(split_obj)
+```
+
+```{r}
+glimpse(train_tbl)
+```
+
+```{r}
+glimpse(test_tbl)
+```
+## Implement ML Algorithms
+- implement 3 modeling approaches:
+1. Linear Regression - Linear, Explainable (Baseline)
+2. Decision Tree - Pros: Non-Linear, Explainable; Cons: Lower Performance
+3. XGBoost - Pros: Non-Linear, High Performance; Cons: Less Explainable
+
+### Linear Regression (Baseline)
+- create a model using the training data and predict on the test data 
+```{r}
+model_01_lm <- linear_reg("regression") %>% 
+  set_engine("lm") %>% 
+  fit(Enrollments ~ ., data = train_tbl %>% select(-row_id))
+```
+
+```{r}
+pred_01_lm <- model_01_lm %>%
+  predict(new_data = test_tbl) %>%
+  bind_cols(test_tbl %>% select(Enrollments)) 
+
+pred_01_lm %>% 
+  metrics(truth = Enrollments, estimate = .pred) %>% 
+  knitr::kable()
+```
+
+```{r warning=FALSE, fig.width=6}
+pred_01_lm %>% 
+  mutate(observation = row_number() %>% as.character()) %>% 
+  gather(key = "key", value = "value", -observation, factor_key = TRUE) %>% 
+  plot_ly(x = ~observation, y = ~value, color = ~key, type = "scatter", mode = "markers") %>%
+  layout(title = "Prediction vs Annual Enrollments: Model 1 - Linear Regression")
+```
+### What's driving this model?
+Use the tidy() function from the broom package to help. This gets us the model estimates. We can arrange by “p.value” to get an idea of how important the model terms are. Clicks, Pageviews, and Experiment are judged strong predictors with a p-value less than 0.05. However, we want to try out other modeling techniques to judge this. We note that the coefficient of Experiment is -17.6, and because the term is binary (0 or 1) this can be interpreted as decreasing Enrollments by -17.6 per day when the Experiment is run.
+
+```{r}
+linear_regression_model_terms_tbl <- model_01_lm$fit %>% 
+  tidy() %>% 
+  arrange(p.value) %>% 
+  mutate(term = as.factor(term) %>% fct_rev())
+
+linear_regression_model_terms_tbl %>% knitr::kable()
+```
+Visualizing the features show that clicks, pageviews and experiment are the most important features and are likely to be the best predictors 
+```{r}
+linear_regression_model_terms_tbl %>% 
+  arrange(desc(p.value), term) %>% 
+  plot_ly(x = ~p.value, y = ~term, type = "scatter", mode = "markers") %>% 
+  add_lines(x = ~0.05) %>% 
+  layout(title = "Feature Importance: Model 1 - Linear Regression")
+```
+## Set-up Helper Functions
+
+```{r}
+calc_metrics <- function(model, new_data) {
+  model %>%
+    predict(new_data = new_data) %>% 
+    bind_cols(new_data %>% select(Enrollments)) %>% 
+    metrics(truth = Enrollments, 
+            estimate = .pred)
+}
+```
+
+```{r}
+plot_predictions <- function(model, new_data) {
+  predict(model, new_data) %>% 
+    bind_cols(new_data %>% select(Enrollments)) %>% 
+    mutate(observation = row_number() %>% as.character()) %>% 
+    gather(key = "key", value = "value", -observation, factor_key = TRUE) %>% 
+    plot_ly(x = ~observation, y = ~value, color = ~key, type = "scatter", mode = "markers")
+}
+```
+
+## Decision Trees
+Decision Trees are excellent models that can pick up on non-linearities and often make very informative models that compliment linear models by providing a different way of viewing the problem.
+We can implement a decision tree with decision_tree(). We’ll set the engine to “rpart”, a popular decision tree package. There are a few key tunable parameters:
+- cost_complexity: A cutoff for model splitting based on increase in explainability
+- tree_depth: The max tree depth
+- min_n: The minimum number of observations in terminal (leaf) nodes
+The parameters selected for the model were determined using 5-fold cross validation to prevent over-fitting.
+
+```{r}
+model_02_decision_tree <- decision_tree(
+    mode = "regression", 
+    cost_complexity = 0.001, 
+    tree_depth = 5, 
+    min_n = 4) %>% 
+  set_engine("rpart") %>% 
+  fit(Enrollments ~ ., data = train_tbl %>% select(-row_id))
+```
+
+Next, calculate the metrics on this model using our helper function, calc_metrics(). The MAE of the predictions is approximately the same as the linear model at +/-19 Enrollments per day.
+```{r}
+model_02_decision_tree %>% 
+  calc_metrics(test_tbl) %>% 
+  knitr::kable()
+```
+
+```{r, warning=FALSE}
+model_02_decision_tree %>% 
+  plot_predictions(test_tbl) %>% 
+  layout(title = "Prediction vs Actual Enrollments: Decision Tree")
+```
+
+Finally, use rpart.plot() to visualize the decision tree rules. Note that we need to extract the underlying “rpart” model from the parsnip model object using the model_02_decision_tree$fit
+```{r}
+model_02_decision_tree$fit %>% 
+  rpart.plot(roundint = FALSE, 
+             cex = 0.8, 
+             fallen.leaves = TRUE, 
+             extra = 101, 
+             main = "Model 02: Decision Tree")
+```
+Interpreting the decision tree is straightforward: Each decision is a rule, and Yes is to the left, No is to the right. The top features are the most important to the model (“Pageviews” and “Clicks”). The decision tree shows that “Experiment” is involved in the decision rules. The rules indicate a when Experiment >= 0.5, there is a drop in enrollments.
+
+Key Points:
+
+Our new model has roughly the same accuracy to +/-19 enrollments (MAE) as the linear regression model.
+
+Experiment shows up towards the bottom of the tree. The rules indicate a when Experiment >= 0.5, there is a drop in enrollments.
+
+## XGBoost
+Several key tuning parameters include:
+- mtry: The number of predictors that will be randomly sampled at each split when creating the tree models.
+- trees: The number of trees contained in the ensemble.
+- min_n: The minimum number of data points in a node that are required for the node to be split further.
+- tree_depth: The maximum depth of the tree (i.e. number of splits).
+- learn_rate: The rate at which the boosting algorithm adapts from iteration-to-iteration.
+- loss_reduction: The reduction in the loss function required to split further.
+- sample_size: The amount of data exposed to the fitting routine.
+
+The parameters selected for the model were determined using 5-fold cross validation to prevent over-fitting.
+
+```{r}
+set.seed(123)
+
+model_03_xgboost <- boost_tree(
+    mode = "regression", 
+    mtry = 100, 
+    trees = 1000, 
+    min_n = 8, 
+    tree_depth = 6, 
+    learn_rate = 0.2, 
+    loss_reduction = 0.01, 
+    sample_size = 1) %>% 
+  set_engine("xgboost") %>% 
+  fit(Enrollments ~ ., data = train_tbl %>% select(-row_id))
+```
+
+```{r}
+model_03_xgboost %>% 
+  calc_metrics(test_tbl) %>% 
+  knitr::kable()
+```
+
+```{r warning=FALSE}
+model_03_xgboost %>% 
+  plot_predictions(test_tbl) %>% 
+  layout(title = "Prediction vs Actual Enrollments: XGBoost")
+```
+### Feature Importance
+```{r}
+xgboost_feature_importance_tbl <- model_03_xgboost$fit %>% 
+  xgb.importance(model = .) %>% 
+  as_tibble() %>% 
+  mutate(Feature = as_factor(Feature) %>% fct_rev())
+
+xgboost_feature_importance_tbl %>% knitr::kable()
+```
+
+
+```{r}
+xgboost_feature_importance_tbl %>% 
+  mutate(Label = paste0(round(Gain*100, 1)), "%") %>% 
+  plot_ly(x = ~Gain, y = ~Feature, type = "scatter", mode = "markers", name = ~Label) %>% 
+  layout(title = "XGBoost Feature Importance")
+```
+The information gain is 93% from Pageviews and Clicks combined. Experiment has about a 7% contribution to information gain, indicating it’s still predictive (just not nearly as much as Pageviews). This tells a story that if Enrollments are critical, Udacity should focus on getting Pageviews.
+
+Key Points:
+- The XGBoost model error has dropped to +/-11 Enrollments.
+- The XGBoost shows that Experiment provides an information gain of 7%
+- The XGBoost model tells a story that Udacity should be focusing on Page Views and secondarily Clicks to maintain or increase Enrollments. The features drive the system.
+
+## Business Conclusions
+There are several key benefits to performing A/B Testing using Machine Learning. These include:
+
+Understanding the Complex System - We discovered that the system is driven by Pageviews and Clicks. Statistical Inference would not have identified these drivers. Machine Learning did.
+
+Providing a direction and magnitude of the experiment - We saw that Experiment = 1 drops enrollments by -17.6 Enrollments Per Day in the Linear Regression. We saw similar drops in the Decision Tree rules. Statistical inference would not have identified magnitude and direction. Only whether or not the Experiment had an effect.
+
+What Should Udacity Do?
+
+If Udacity wants to maximimize enrollments, it should focus on increasing Page Views from qualified candidates. Page Views is the most important feature in 2 of 3 models.
+
+If Udacity wants alert people of the time commitment, the additional popup form is expected to decrease the number of enrollments. The negative impact can be seen in the decision tree (when Experiment <= 0.5, Enrollments go down) and in the linear regression model term (-17.6 Enrollments when Experiment = 1). Is this OK? It depends on what Udacity’s goals are.
+
+## Cross Validation and Improving Modeling Performance
+Two important further considerations when implementing an A/B Test using Machine Learning are:
+1. How to Improve Modeling Performance
+2. The need for Cross-Validation for Tuning Model Parameters
+
+### Improving Modeling Performance
+- run analysis on unaggregated data (data in this exercise was aggregated)
+- run analysis on individual customer data to determine probability on an individual customer enrolling
+- include good features; customer-related features not included in this data set
+
+### Cross-Validation for Tuning Models
+- In practice, we need to perform cross-validation to prevent the models from being tuned to the test data set.
+
+## Using caret
+
+```{r}
+```
+
+
+```{r}
+```
+
+
+```{r}
+```
+
